@@ -1,0 +1,17 @@
+services:
+  hako:
+    build: .
+    image: hako:latest
+    container_name: hako
+    restart: unless-stopped
+    ports:
+      - "8096:8096"
+    environment:
+      - TZ=Asia/Tokyo
+      # 自動スキャンの間隔（分）。0 で無効
+      - HAKO_SCAN_INTERVAL_MIN=60
+    volumes:
+      # データベース・キャッシュ（消さないでください）
+      - ./data:/data
+      # 音楽フォルダ（読み取り専用）。左側を自分の音楽フォルダのパスに書き換えてください
+      - ./music:/music:ro
