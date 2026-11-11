@@ -1,3 +1,6 @@
 data/
 music/
 *.exe
+# secrets / Tailscale login state
+.env
+tailscale/state/

@@ -1,0 +1,47 @@
+# Tailscale 付きの構成（サイドカー方式）
+#   1. docker compose -f docker-compose.tailscale.yml up -d --build
+#   2. docker compose -f docker-compose.tailscale.yml logs -f tailscale
+#      → 表示される https://login.tailscale.com/a/... を開いてログイン（初回のみ）
+#   → https://hako.<あなたのtailnet>.ts.net で HTTPS 接続できます（自分の端末からのみ）
+#   ※ .env に TS_AUTHKEY を書いておけば URL を開かずに自動登録もできます
+services:
+  tailscale:
+    image: tailscale/tailscale:stable
+    container_name: hako-tailscale
+    hostname: hako # Tailscale 上のマシン名 → https://hako.xxxx.ts.net
+    restart: unless-stopped
+    environment:
+      # 空なら起動ログにログイン用URLが表示されます
+      - TS_AUTHKEY=${TS_AUTHKEY:-}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_SERVE_CONFIG=/config/serve.json
+      - TS_USERSPACE=false
+    volumes:
+      - ./tailscale/state:/var/lib/tailscale # ログイン状態（消すと再登録が必要）
+      - ./tailscale/serve.json:/config/serve.json:ro
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - net_admin
+    # 家のLANからも http://<サーバーのIP>:8096 で使いたい場合はコメントを外す
+    # （その場合 LAN 内の端末は接続元IPを偽装できる点に注意）
+    # ports:
+    #   - "8096:8096"
+
+  hako:
+    build: .
+    image: hako:latest
+    container_name: hako
+    restart: unless-stopped
+    network_mode: service:tailscale # Tailscale コンテナのネットワークを共有
+    depends_on:
+      - tailscale
+    environment:
+      - TZ=Asia/Tokyo
+      - HAKO_SCAN_INTERVAL_MIN=60
+      # tailscale serve 経由のアクセス元IPを正しく扱う（ロック機能・端末一覧用）
+      - HAKO_TRUST_PROXY=1
+    volumes:
+      - ./data:/data
+      # 左側を自分の音楽フォルダのパスに書き換えてください（複数可）
+      - ./music:/music:ro

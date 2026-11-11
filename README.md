@@ -43,6 +43,43 @@ Go製のサーバー1つ ＋ インストール可能なWebアプリ（PWA）で
 以降は60分ごとに自動で再スキャンします（`HAKO_SCAN_INTERVAL_MIN` で変更、`0` で無効）。
 設定画面の「スキャン」ボタンからすぐに反映することもできます。
 
+## Tailscale 込みで起動する（おすすめ）
+
+Tailscale のコンテナを Hako の隣で動かし、`https://hako.<tailnet名>.ts.net` で HTTPS 公開します。
+サーバー本体への Tailscale のインストールやポート開放は不要で、外出先からも自分の端末だけが接続できます。
+
+1. [Tailscale](https://tailscale.com/) のアカウントを作り、スマホにも Tailscale アプリを入れて同じアカウントでログインします
+2. Tailscale 管理画面の **DNS** で「MagicDNS」と「HTTPS Certificates」を有効にします
+3. `docker-compose.tailscale.yml` の音楽フォルダのパスを書き換えて起動します
+
+   ```bash
+   docker compose -f docker-compose.tailscale.yml up -d --build
+   ```
+
+4. ログを表示して、出てきたログイン用URL（`https://login.tailscale.com/a/...`）をブラウザで開いて承認します（初回のみ）
+
+   ```bash
+   docker compose -f docker-compose.tailscale.yml logs -f tailscale
+   ```
+
+   URLが流れて見失った場合は、次のコマンドでも表示できます（`Ctrl+C` でログ表示を終了）
+
+   ```bash
+   docker compose -f docker-compose.tailscale.yml exec tailscale tailscale status
+   ```
+
+5. スマホで Tailscale をオンにして `https://hako.<tailnet名>.ts.net` を開きます（正確なアドレスは管理画面の Machines に表示されます）。
+   初回は証明書の発行に数十秒かかることがあります
+
+> URLを開かずに自動で登録したい場合（サーバーを作り直すことが多いなど）は、管理画面の **Settings → Keys** で auth key を作り、
+> `.env.example` を `.env` にコピーして `TS_AUTHKEY=` に貼り付けてから起動してください。
+
+**補足**
+- 管理画面の Machines で `hako` の「…」→ **Disable key expiry** にしておくと、180日ごとの再ログインが不要になります
+- ログイン状態は `./tailscale/state` に保存されるので、再起動やアップデートでログインし直す必要はありません（このフォルダを消すと再ログインが必要）
+- `.env`（キー）と `tailscale/state` は `.gitignore` 済みです。GitHub に上げないでください
+- `tailscale funnel`（インターネット全体への公開）は `serve.json` で無効にしてあります
+
 ## スマホにアプリとしてインストールする（Android）
 
 Chromeで開いてメニューの「アプリをインストール」を選びます。

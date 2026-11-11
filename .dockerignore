@@ -6,3 +6,7 @@ music
 Dockerfile
 docker-compose.yml
 README.md
+.env
+tailscale
+docker-compose.tailscale.yml
+.env.example
