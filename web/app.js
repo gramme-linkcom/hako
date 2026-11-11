@@ -1665,6 +1665,21 @@ document.addEventListener('keydown', (e) => {
   else if (e.key === 'ArrowLeft') seek(position() - 10);
 });
 
+// block reload shortcuts (F5, Ctrl/Cmd+R, Ctrl+Shift+R): reloading would stop playback
+window.addEventListener('keydown', (e) => {
+  const k = e.key.toLowerCase();
+  if (k === 'f5' || ((e.ctrlKey || e.metaKey) && k === 'r')) {
+    e.preventDefault();
+    toast('アプリ内ではリロードできません');
+  }
+}, true);
+
+// ask before leaving/reloading while music is playing (browser shows its own dialog)
+window.addEventListener('beforeunload', (e) => {
+  saveQueue();
+  if (!audio.paused && state.me) { e.preventDefault(); e.returnValue = ''; }
+});
+
 window.addEventListener('pagehide', saveQueue);
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') saveQueue(); });
 

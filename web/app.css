@@ -17,6 +17,9 @@
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; background: var(--bg); color: var(--fg); }
+/* disable pull-to-refresh (Chrome reads this from the root scroller) and scroll chaining */
+html { overscroll-behavior: none; }
+.qlist, .lyrics, .menu, .dialog, .dir-list, #side { overscroll-behavior: contain; }
 body {
   font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", "Yu Gothic UI", sans-serif;
   font-size: 15px; line-height: 1.45;
