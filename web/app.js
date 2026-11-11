@@ -137,8 +137,14 @@ function shuffleArr(a) {
    Player engine
    ============================================================ */
 
-const audio = new Audio();
-audio.preload = 'auto';
+// Two players: `audio` is the one playing, `spare` preloads the next track near the end of the
+// current one. On "ended" they are swapped so the next track starts instantly. Without this,
+// Android pauses/freezes background pages during the silent gap while the next track loads,
+// and playback stops after the first track.
+const mkAudio = () => { const a = new Audio(); a.preload = 'auto'; return a; };
+let audio = mkAudio();
+let spare = mkAudio();
+const PRELOAD_BEFORE_END = 30; // seconds
 
 const P = {
   queue: [], orig: null, idx: -1,
@@ -147,6 +153,7 @@ const P = {
   listened: 0, lastT: 0, scrobbled: false,
   forceTx: new Set(), dragging: false,
   userVol: clamp(+state.prefs.volume || 1, 0, 1), norm: null,
+  pre: null, // { id, direct } of the track loaded into `spare`
 };
 const cur = () => P.queue[P.idx];
 const position = () => P.offset + (audio.currentTime || 0);
@@ -161,19 +168,79 @@ function canDirect(t) {
   return true;
 }
 
+function trackSrc(t, start = 0) {
+  return canDirect(t)
+    ? `/api/tracks/${t.id}/stream?mode=direct`
+    : `/api/tracks/${t.id}/stream?br=${qualityBr()}&start=${start.toFixed(2)}`;
+}
+
+function resetListen() { P.listened = 0; P.lastT = 0; P.scrobbled = false; P.needsLoad = false; }
+
+function startPlayback() {
+  audio.play().catch((e) => { if (e.name !== 'AbortError') console.warn(e); });
+}
+
 function loadTrack(idx, start = 0, play = true) {
   if (idx < 0 || idx >= P.queue.length) return;
+  // the requested track is already buffered in the spare player: switch instantly
+  if (start === 0 && play && P.pre && P.queue[idx] && P.pre.id === P.queue[idx].id && playPreloaded(idx)) return;
   P.idx = idx;
   const t = cur();
   P.direct = canDirect(t);
   P.offset = P.direct ? 0 : start;
-  P.listened = 0; P.lastT = 0; P.scrobbled = false; P.needsLoad = false;
-  audio.src = P.direct
-    ? `/api/tracks/${t.id}/stream?mode=direct`
-    : `/api/tracks/${t.id}/stream?br=${qualityBr()}&start=${start.toFixed(2)}`;
-  if (P.direct && start > 0) audio.addEventListener('loadedmetadata', () => { audio.currentTime = start; }, { once: true });
-  if (play) audio.play().catch((e) => { if (e.name !== 'AbortError') console.warn(e); });
+  resetListen();
+  audio.src = trackSrc(t, start);
+  const el = audio;
+  if (P.direct && start > 0) el.addEventListener('loadedmetadata', () => { el.currentTime = start; }, { once: true });
+  applyVolume();
+  if (play) startPlayback();
   onTrackChange();
+}
+
+// index of the track that plays after the current one (-1 = none)
+function nextIndex() {
+  if (!P.queue.length) return -1;
+  if (P.idx + 1 < P.queue.length) return P.idx + 1;
+  return P.repeat === 'all' ? 0 : -1;
+}
+
+// load the upcoming track into the spare player so it can start without a gap
+function preloadNext() {
+  if (P.repeat === 'one') return;
+  const ni = nextIndex();
+  const t = ni >= 0 ? P.queue[ni] : null;
+  if (!t || (P.pre && P.pre.id === t.id)) return;
+  P.pre = { id: t.id, direct: canDirect(t) };
+  spare.src = trackSrc(t, 0);
+  spare.load();
+}
+
+function clearPreload() {
+  P.pre = null;
+  spare.pause();
+  spare.removeAttribute('src');
+  spare.load();
+}
+
+// swap players and start the preloaded track; returns false if it is not usable
+function playPreloaded(ni) {
+  const t = P.queue[ni];
+  if (!P.pre || !t || P.pre.id !== t.id || !spare.getAttribute('src') || spare.error) return false;
+  const old = audio;
+  audio = spare;
+  spare = old;
+  P.idx = ni;
+  P.direct = P.pre.direct;
+  P.offset = 0;
+  P.pre = null;
+  resetListen();
+  applyVolume(); // before play() so the new track never starts too loud
+  startPlayback();
+  old.pause();
+  old.removeAttribute('src');
+  old.load();
+  onTrackChange();
+  return true;
 }
 
 function playList(tracks, i = 0, shuffle = false) {
@@ -200,10 +267,15 @@ function togglePlay() {
 
 function next(auto = false) {
   if (!P.queue.length) return;
-  if (auto && P.repeat === 'one') { loadTrack(P.idx, 0, true); return; }
-  if (P.idx + 1 < P.queue.length) loadTrack(P.idx + 1);
-  else if (P.repeat === 'all') loadTrack(0);
-  else if (auto) { loadTrack(P.idx, 0, false); }
+  if (auto && P.repeat === 'one') {
+    // replay in place (no reload for direct files, so no gap in the background)
+    if (P.direct) { resetListen(); audio.currentTime = 0; startPlayback(); }
+    else loadTrack(P.idx, 0, true);
+    return;
+  }
+  const ni = nextIndex();
+  if (ni >= 0) loadTrack(ni); // uses the preloaded player when possible
+  else if (auto) loadTrack(P.idx, 0, false);
   else toast('キューの最後です');
 }
 
@@ -284,13 +356,14 @@ function removeFromQueue(i) {
 
 function stopAll() {
   audio.pause(); audio.removeAttribute('src'); audio.load();
+  clearPreload();
   P.queue = []; P.orig = null; P.idx = -1;
   onTrackChange(); saveQueue();
 }
 
 /* ---- audio events ---- */
 
-audio.addEventListener('timeupdate', () => {
+function onTimeUpdate() {
   const ct = audio.currentTime;
   const d = ct - P.lastT;
   if (d > 0 && d < 2) P.listened += d;
@@ -301,17 +374,31 @@ audio.addEventListener('timeupdate', () => {
     api(`/tracks/${t.id}/scrobble`, { method: 'POST' }).catch(() => {});
     t.plays = (t.plays || 0) + 1;
   }
+  const dur = duration();
+  if (dur && dur - position() < PRELOAD_BEFORE_END) preloadNext();
   updateProgress();
   updateLyrics();
   throttledPosState();
   throttledSave();
-});
-audio.addEventListener('play', onPlayState);
-audio.addEventListener('pause', onPlayState);
-audio.addEventListener('ended', () => next(true));
-audio.addEventListener('error', () => {
+}
+
+// both players get the same listeners; only events from the active one are handled
+function wire(el) {
+  el.addEventListener('timeupdate', () => { if (el === audio) onTimeUpdate(); });
+  el.addEventListener('play', () => { if (el === audio) onPlayState(); });
+  el.addEventListener('pause', () => { if (el === audio) onPlayState(); });
+  el.addEventListener('ended', () => { if (el === audio) next(true); });
+  el.addEventListener('error', () => {
+    if (el === audio) onAudioError();
+    else if (P.pre && el.getAttribute('src')) P.pre = null; // preload failed: load normally later
+  });
+}
+wire(audio);
+wire(spare);
+
+function onAudioError() {
   const t = cur();
-  if (!t || !audio.src || audio.error == null) return;
+  if (!t || !audio.getAttribute('src') || audio.error == null) return;
   if (P.direct) {
     P.forceTx.add(t.id);
     const pos = position();
@@ -321,7 +408,8 @@ audio.addEventListener('error', () => {
     toast('再生できませんでした', true);
     setTimeout(() => { if (cur() === t && P.idx + 1 < P.queue.length) next(); }, 1500);
   }
-});
+}
+
 /* ---- volume & loudness normalisation ----
    audio.volume = user volume × normalisation factor. The factor can only lower the level
    (audio.volume is capped at 1), so the default target (-14 LUFS) is chosen so that most
