@@ -154,6 +154,7 @@ const P = {
   forceTx: new Set(), dragging: false,
   userVol: clamp(+state.prefs.volume || 1, 0, 1), norm: null,
   pre: null, // { id, direct } of the track loaded into `spare`
+  retries: 0, retryTimer: 0, retryListened: 0, recGen: 0, // recovery from network drops / stalls
 };
 const cur = () => P.queue[P.idx];
 const position = () => P.offset + (audio.currentTime || 0);
@@ -180,15 +181,22 @@ function startPlayback() {
   audio.play().catch((e) => { if (e.name !== 'AbortError') console.warn(e); });
 }
 
-function loadTrack(idx, start = 0, play = true) {
+function cancelRecovery() { if (P.retryTimer > 0) clearTimeout(P.retryTimer); P.retryTimer = 0; P.recGen++; }
+
+// recovering = reload of the same track after a network drop/stall: keeps the listen count
+function loadTrack(idx, start = 0, play = true, recovering = false) {
   if (idx < 0 || idx >= P.queue.length) return;
+  cancelRecovery();
+  if (!recovering) P.retries = 0;
   // the requested track is already buffered in the spare player: switch instantly
   if (start === 0 && play && P.pre && P.queue[idx] && P.pre.id === P.queue[idx].id && playPreloaded(idx)) return;
   P.idx = idx;
   const t = cur();
   P.direct = canDirect(t);
   P.offset = P.direct ? 0 : start;
+  const keep = recovering ? { listened: P.listened, scrobbled: P.scrobbled } : null;
   resetListen();
+  if (keep) Object.assign(P, keep);
   audio.src = trackSrc(t, start);
   const el = audio;
   if (P.direct && start > 0) el.addEventListener('loadedmetadata', () => { el.currentTime = start; }, { once: true });
@@ -233,6 +241,7 @@ function playPreloaded(ni) {
   P.direct = P.pre.direct;
   P.offset = 0;
   P.pre = null;
+  P.retries = 0;
   resetListen();
   applyVolume(); // before play() so the new track never starts too loud
   startPlayback();
@@ -262,7 +271,7 @@ function playList(tracks, i = 0, shuffle = false) {
 function togglePlay() {
   if (!cur()) return;
   if (P.needsLoad || !audio.src) { loadTrack(P.idx, P.pendingStart || 0, true); return; }
-  if (audio.paused) audio.play().catch(() => {}); else audio.pause();
+  if (audio.paused) audio.play().catch(() => {}); else { cancelRecovery(); audio.pause(); }
 }
 
 function next(auto = false) {
@@ -355,6 +364,7 @@ function removeFromQueue(i) {
 }
 
 function stopAll() {
+  cancelRecovery();
   audio.pause(); audio.removeAttribute('src'); audio.load();
   clearPreload();
   P.queue = []; P.orig = null; P.idx = -1;
@@ -374,6 +384,8 @@ function onTimeUpdate() {
     api(`/tracks/${t.id}/scrobble`, { method: 'POST' }).catch(() => {});
     t.plays = (t.plays || 0) + 1;
   }
+  // playing fine again for a while after a recovery: allow fresh retries later
+  if (P.retries && P.listened - P.retryListened > 30) P.retries = 0;
   const dur = duration();
   if (dur && dur - position() < PRELOAD_BEFORE_END) preloadNext();
   updateProgress();
@@ -387,7 +399,20 @@ function wire(el) {
   el.addEventListener('timeupdate', () => { if (el === audio) onTimeUpdate(); });
   el.addEventListener('play', () => { if (el === audio) onPlayState(); });
   el.addEventListener('pause', () => { if (el === audio) onPlayState(); });
-  el.addEventListener('ended', () => { if (el === audio) next(true); });
+  el.addEventListener('ended', () => {
+    if (el !== audio) return;
+    // a converted stream that ends well before the track's length was cut off (connection
+    // dropped): continue from where it stopped instead of skipping the rest of the song
+    // (if it ends again at the same spot, the stored duration is just wrong: move on)
+    const t = cur(), pos = position();
+    if (!P.direct && t && t.duration && pos < t.duration - 5 && !(P.cutAt && Math.abs(pos - P.cutAt.pos) < 3 && P.cutAt.id === t.id)) {
+      P.cutAt = { id: t.id, pos };
+      recover();
+      return;
+    }
+    P.cutAt = null;
+    next(true);
+  });
   el.addEventListener('error', () => {
     if (el === audio) onAudioError();
     else if (P.pre && el.getAttribute('src')) P.pre = null; // preload failed: load normally later
@@ -396,19 +421,65 @@ function wire(el) {
 wire(audio);
 wire(spare);
 
+const MAX_RETRIES = 6;
+
+// reload the current track at the current position after a network drop or stall
+// (common on phones switching between Wi-Fi and mobile data, or when Tailscale reconnects)
+function recover() {
+  const t = cur();
+  if (!t || P.retryTimer) return;
+  if (P.retries >= MAX_RETRIES) {
+    P.retries = 0;
+    toast('再生できませんでした', true);
+    if (P.idx + 1 < P.queue.length) next();
+    return;
+  }
+  const pos = position();
+  const delay = Math.min(8000, 500 * 2 ** P.retries);
+  const gen = ++P.recGen;
+  const attempt = () => {
+    if (gen !== P.recGen || cur() !== t) return; // cancelled (track changed / user action)
+    P.retryTimer = 0;
+    if (navigator.onLine === false) { // wait for the connection to come back (doesn't use up retries)
+      P.retryTimer = -1;
+      window.addEventListener('online', attempt, { once: true });
+      return;
+    }
+    P.retries++;
+    P.retryListened = P.listened;
+    loadTrack(P.idx, pos, true, true);
+  };
+  P.retryTimer = setTimeout(attempt, delay);
+}
+
 function onAudioError() {
   const t = cur();
   if (!t || !audio.getAttribute('src') || audio.error == null) return;
-  if (P.direct) {
+  const code = audio.error.code;
+  if (code === 1) return; // MEDIA_ERR_ABORTED: we changed the source ourselves
+  if (P.direct && code !== 2) {
+    // decode / unsupported format: let the server convert it
     P.forceTx.add(t.id);
     const pos = position();
     toast('このファイルは直接再生できないため、変換して再生します');
     loadTrack(P.idx, pos, true);
-  } else {
-    toast('再生できませんでした', true);
-    setTimeout(() => { if (cur() === t && P.idx + 1 < P.queue.length) next(); }, 1500);
+    return;
   }
+  // network error (or a converted stream failed): retry from the same position
+  recover();
 }
+
+// watchdog: playback is "on" but the position hasn't moved for a while (stuck buffering after
+// the connection silently died) → reload from the current position
+const STALL_MS = 15000;
+const wd = { el: null, t: -1, since: 0 };
+setInterval(() => {
+  const now = Date.now();
+  if (!cur() || audio.paused || audio.ended || P.retryTimer || P.needsLoad) { wd.el = null; return; }
+  const ct = audio.currentTime;
+  if (wd.el !== audio || ct !== wd.t) { wd.el = audio; wd.t = ct; wd.since = now; return; }
+  if (now - wd.since > STALL_MS) { wd.since = now; recover(); }
+}, 2000);
 
 /* ---- volume & loudness normalisation ----
    audio.volume = user volume × normalisation factor. The factor can only lower the level
@@ -463,8 +534,8 @@ function updateMediaSession() {
 if ('mediaSession' in navigator) {
   const h = (a, f) => { try { navigator.mediaSession.setActionHandler(a, f); } catch {} };
   h('play', () => togglePlay());
-  h('pause', () => audio.pause());
-  h('stop', () => audio.pause());
+  h('pause', () => { cancelRecovery(); audio.pause(); });
+  h('stop', () => { cancelRecovery(); audio.pause(); });
   h('previoustrack', () => prev());
   h('nexttrack', () => next());
   h('seekto', (d) => seek(d.seekTime));
