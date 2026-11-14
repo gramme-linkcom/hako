@@ -269,7 +269,7 @@ func (a *App) readTags(path string) (*tagInfo, error) {
 			m.HasLyrics = true
 		}
 	}
-	if !m.HasLyrics && lrcFile(path) != "" {
+	if !m.HasLyrics && (lrcFile(path) != "" || a.editedLyricsFile(path) != "") {
 		m.HasLyrics = true
 	}
 	if m.Title == "" {
@@ -423,39 +423,9 @@ func parseLyrics(text string) *Lyrics {
 }
 
 func (a *App) lyricsFor(t *Track) *Lyrics {
-	if f := lrcFile(t.Path); f != "" {
-		if b, err := os.ReadFile(f); err == nil {
-			if l := parseLyrics(decodeText(b)); len(l.Lines) > 0 {
-				return l
-			}
-		}
-	}
-	p, err := a.ffprobe(t.Path)
-	if err != nil {
-		return nil
-	}
-	tags := map[string]string{}
-	for k, v := range p.Format.Tags {
-		tags[strings.ToLower(k)] = v
-	}
-	for _, s := range p.Streams {
-		if s.CodecType == "audio" {
-			for k, v := range s.Tags {
-				tags[strings.ToLower(k)] = v
-			}
-		}
-	}
-	keys := make([]string, 0)
-	for k := range tags {
-		if strings.HasPrefix(k, "lyrics") || k == "unsyncedlyrics" || k == "uslt" {
-			keys = append(keys, k)
-		}
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		if l := parseLyrics(fixText(tags[k])); len(l.Lines) > 0 {
-			return l
-		}
+	text, _ := a.rawLyrics(t)
+	if l := parseLyrics(text); len(l.Lines) > 0 {
+		return l
 	}
 	return nil
 }

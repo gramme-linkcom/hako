@@ -60,7 +60,7 @@ func main() {
 	}
 	cfg.ScanInterval = time.Duration(mins) * time.Minute
 
-	for _, d := range []string{"", "cache/covers"} {
+	for _, d := range []string{"", "cache/covers", "lyrics"} {
 		if err := os.MkdirAll(filepath.Join(cfg.DataDir, d), 0o755); err != nil {
 			log.Fatal(err)
 		}

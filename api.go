@@ -60,6 +60,8 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("GET /api/tracks/batch", a.auth(a.handleTrackBatch))
 	mux.HandleFunc("GET /api/tracks/{id}", a.auth(a.handleTrack))
 	mux.HandleFunc("GET /api/tracks/{id}/lyrics", a.auth(a.handleLyrics))
+	mux.HandleFunc("GET /api/tracks/{id}/lyrics/source", a.auth(a.handleLyricsSource))
+	mux.HandleFunc("PUT /api/tracks/{id}/lyrics", a.admin(a.handleSaveLyrics))
 	mux.HandleFunc("GET /api/tracks/{id}/stream", a.auth(a.handleStream))
 	mux.HandleFunc("POST /api/tracks/{id}/scrobble", a.auth(a.handleScrobble))
 	mux.HandleFunc("GET /api/favorites", a.auth(a.handleFavorites))

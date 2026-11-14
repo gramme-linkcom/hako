@@ -821,9 +821,9 @@ async function loadLyrics() {
   }
   lyr = l; lyrCur = -1;
   const b = $('#lyr');
-  if (!l.lines.length) { b.className = 'lyrics plain'; b.innerHTML = '<div class="empty">歌詞がありません<div class="small dim" style="margin-top:8px">曲と同じ名前の .lrc ファイルを置くか、タグに歌詞を埋め込むと表示されます</div></div>'; return; }
+  if (!l.lines.length) { b.className = 'lyrics plain'; b.innerHTML = '<div class="empty">歌詞がありません<div class="small dim" style="margin-top:8px">曲と同じ名前の .lrc ファイルを置くか、歌詞エディタで作成すると表示されます</div><button class="btn small" style="margin-top:14px" data-lyr-edit>歌詞を作成する</button></div>'; return; }
   b.className = l.synced ? 'lyrics' : 'lyrics plain';
-  b.innerHTML = l.lines.map((x, i) => `<p data-li="${i}">${esc(x.text) || '&nbsp;'}</p>`).join('');
+  b.innerHTML = l.lines.map((x, i) => `<p data-li="${i}">${esc(x.text) || '&nbsp;'}</p>`).join('') + '<div class="lyr-edit"><button class="btn small" data-lyr-edit>歌詞を編集</button></div>';
   updateLyrics(true);
 }
 
@@ -889,6 +889,7 @@ function trackMenu(t, extra = []) {
   ];
   if (t.album_id) items.push({ icon: I.album, label: 'アルバムを表示', nav: `#/album/${t.album_id}` });
   if (t.artist_id) items.push({ icon: I.artist, label: 'アーティストを表示', nav: `#/artist/${t.artist_id}` });
+  items.push({ icon: I.lyrics, label: '歌詞を作成・編集', nav: `#/lyrics/${t.id}` });
   items.push({ icon: I.download, label: 'ダウンロード', run: () => { const a = document.createElement('a'); a.href = `/api/tracks/${t.id}/stream?dl=1`; a.download = ''; document.body.appendChild(a); a.click(); a.remove(); } });
   menu(`${coverHTML(t.album_id, t.cv, 96, t.album || t.title)}<div class="ellipsis"><div class="ellipsis" style="font-weight:600">${esc(t.title)}</div><div class="small muted ellipsis">${esc(t.artist)}${t.album ? ' · ' + esc(t.album) : ''}</div></div>`, items);
 }
@@ -968,6 +969,303 @@ function setTop(title, { back = false, actions = '' } = {}) {
 }
 
 /* ============================================================
+   Lyrics editor (#/lyrics/<track id>)
+   Step 1: paste the lyrics text. Step 2: play the song and tap once per line.
+   Saved on the server in <data>/lyrics (music folder stays read-only); can also be
+   downloaded as a .lrc file.
+   ============================================================ */
+
+// keyboard hook for pages that take over shortcuts (returns true when handled)
+let keyHook = null;
+
+const LRC_TIME = /\[(\d{1,3}):(\d{1,2}(?:[.:]\d{1,3})?)\]/g;
+
+// parse text (LRC or plain) into editor lines: [{ t: seconds|null, text }]
+function lrcToLines(text) {
+  const out = [];
+  for (const raw of String(text || '').replace(/\r\n?/g, '\n').split('\n')) {
+    const times = [...raw.matchAll(LRC_TIME)];
+    if (!times.length) {
+      const s = raw.trim();
+      if (/^\[[a-z#]+:.*\]$/i.test(s)) continue; // [ti:...] etc.
+      if (s) out.push({ t: null, text: s });
+      continue;
+    }
+    const txt = raw.slice(times[times.length - 1].index + times[times.length - 1][0].length).trim();
+    for (const m of times) out.push({ t: +m[1] * 60 + parseFloat(m[2].replace(':', '.')), text: txt });
+  }
+  if (out.some((l) => l.t != null)) out.sort((a, b) => (a.t ?? Infinity) - (b.t ?? Infinity));
+  return out;
+}
+
+function lrcStamp(t) {
+  const cs = Math.max(0, Math.round(t * 100));
+  return `[${String(Math.floor(cs / 6000)).padStart(2, '0')}:${String(Math.floor(cs / 100) % 60).padStart(2, '0')}.${String(cs % 100).padStart(2, '0')}]`;
+}
+
+function linesToLrc(lines, t) {
+  const head = [t.title && `[ti:${t.title}]`, t.artist && `[ar:${t.artist}]`, t.album && `[al:${t.album}]`, '[by:Hako]'].filter(Boolean);
+  const timed = lines.filter((l) => l.t != null);
+  if (!timed.length) return lines.map((l) => l.text).join('\n');
+  return [...head, ...timed.map((l) => lrcStamp(l.t) + l.text)].join('\n');
+}
+
+async function viewLyricsEdit(m, params, stale) {
+  const id = +m[1];
+  const [{ track: t }, src] = await Promise.all([api(`/tracks/${id}`), api(`/tracks/${id}/lyrics/source`)]);
+  if (stale()) return;
+  setTop('歌詞エディタ', { back: true });
+  const canSave = !!(state.me && state.me.admin);
+  const ed = {
+    lines: lrcToLines(src.text),
+    mode: 'text',
+    cur: 0, // next line to time
+    sel: -1, // line whose time the ±0.1s buttons change
+    dirty: false,
+    lag: +(localStorage.getItem('hako.lyrLag') ?? 0.1), // tap reaction compensation (seconds)
+    rate: 1,
+  };
+  if (ed.lines.length && ed.lines.every((l) => l.t != null)) ed.cur = ed.lines.length;
+  const srcLabel = { hako: 'Hako で作成した歌詞', file: '.lrc ファイル', tag: '曲に埋め込まれた歌詞', '': 'なし（新規作成）' }[src.source || ''];
+
+  $('#view').innerHTML = `
+    <div class="le-head">${coverHTML(t.album_id, t.cv, 96, t.album || t.title)}
+      <div class="ellipsis"><div class="ellipsis" style="font-weight:700">${esc(t.title)}</div>
+      <div class="small muted ellipsis">${esc(t.artist)}${t.album ? ' · ' + esc(t.album) : ''}</div>
+      <div class="small dim">現在の歌詞: ${esc(srcLabel)}</div></div></div>
+    ${canSave ? '' : '<div class="banner">歌詞の保存は管理者だけができます（.lrc のダウンロードは可能です）</div>'}
+    <div class="tabs2 le-tabs"><button data-le-mode="text">① 歌詞を入力</button><button data-le-mode="sync">② タイミングを付ける</button></div>
+    <div id="le-body"></div>
+    <div class="le-actions">
+      ${canSave ? '<button class="btn primary" id="le-save">保存</button>' : ''}
+      <button class="btn" id="le-dl">${I.download}.lrc をダウンロード</button>
+      ${canSave && src.source === 'hako' ? '<button class="btn danger" id="le-del">作成した歌詞を削除</button>' : ''}
+    </div>`;
+
+  const isMine = () => cur() && cur().id === t.id;
+  const pos = () => (isMine() ? position() : 0);
+
+  function play() {
+    if (!isMine()) { playList([t], 0); }
+    else if (audio.paused) togglePlay();
+    else audio.pause();
+    audio.playbackRate = ed.rate;
+  }
+  function seekTo(s) {
+    if (!isMine()) { playList([t], 0); setTimeout(() => seek(Math.max(0, s)), 300); return; }
+    seek(Math.max(0, s));
+    if (audio.paused) togglePlay();
+  }
+  const markDirty = () => { ed.dirty = true; };
+
+  function renderText() {
+    $('#le-body').innerHTML = `
+      <p class="small muted">1行に1フレーズずつ書いてください。空行は無視されます。すでに時間が付いている行は、文字を変えなければ時間がそのまま残ります。</p>
+      <textarea class="field le-text" id="le-ta" spellcheck="false" placeholder="ここに歌詞を貼り付け">${esc(ed.lines.map((l) => l.text).join('\n'))}</textarea>
+      <div style="margin-top:12px"><button class="btn primary" id="le-next">タイミングを付ける →</button></div>`;
+    $('#le-ta').addEventListener('input', markDirty);
+    $('#le-next').addEventListener('click', () => setMode('sync'));
+  }
+
+  // apply the textarea to the lines, keeping times of unchanged lines
+  function takeText() {
+    const ta = $('#le-ta');
+    if (!ta) return;
+    const old = ed.lines;
+    const texts = ta.value.replace(/\r\n?/g, '\n').split('\n').map((s) => s.replace(LRC_TIME, '').trim()).filter(Boolean);
+    const pool = new Map();
+    old.forEach((l) => { if (l.t != null) { const a = pool.get(l.text) || []; a.push(l.t); pool.set(l.text, a); } });
+    ed.lines = texts.map((text, i) => {
+      if (old[i] && old[i].text === text) return { t: old[i].t, text };
+      const a = pool.get(text);
+      return { t: a && a.length ? a.shift() : null, text };
+    });
+    const firstUntimed = ed.lines.findIndex((l) => l.t == null);
+    ed.cur = firstUntimed < 0 ? ed.lines.length : firstUntimed;
+    ed.sel = -1;
+  }
+
+  function renderSync() {
+    if (!ed.lines.length) {
+      $('#le-body').innerHTML = '<div class="empty">先に「① 歌詞を入力」で歌詞を入力してください</div>';
+      return;
+    }
+    $('#le-body').innerHTML = `
+      <div class="le-help small muted">曲を再生して、<b>次の行が歌い始める瞬間</b>に「タップ」を押します（PC は <kbd>Space</kbd>）。
+        間違えたら「1行戻る」（<kbd>Backspace</kbd>）。行をタップするとその行から付け直せます。時間を押すとそこから再生します。</div>
+      <div class="le-tools">
+        <span class="small muted">速さ</span>
+        <select class="field small" id="le-rate">${[0.5, 0.75, 1].map((r) => `<option value="${r}"${r === ed.rate ? ' selected' : ''}>${r}x</option>`).join('')}</select>
+        <span class="small muted">反応の遅れ補正</span>
+        <select class="field small" id="le-lag">${[0, 0.1, 0.2, 0.3].map((r) => `<option value="${r}"${r === ed.lag ? ' selected' : ''}>${r ? '-' + r + '秒' : 'なし'}</option>`).join('')}</select>
+        <span class="small muted">全体をずらす</span>
+        <button class="btn small" data-le-shift="-0.1">-0.1秒</button><button class="btn small" data-le-shift="0.1">+0.1秒</button>
+        <button class="btn small danger" id="le-clear">時間をすべて消す</button>
+      </div>
+      <div class="le-lines" id="le-lines"></div>
+      <div class="le-bar">
+        <div class="le-time" id="le-time">0:00</div>
+        <button class="icon-btn" id="le-back3" aria-label="3秒戻る">-3</button>
+        <button class="icon-btn big" id="le-pp" aria-label="再生/一時停止">${I.play}</button>
+        <button class="icon-btn" id="le-fwd3" aria-label="3秒進む">+3</button>
+        <div class="le-adj"><button class="btn small" id="le-minus" title="選択行を0.1秒早く">-0.1</button><button class="btn small" id="le-plus" title="選択行を0.1秒遅く">+0.1</button></div>
+        <button class="btn small" id="le-undo">1行戻る</button>
+        <button class="btn primary le-tap" id="le-tap">タップ</button>
+      </div>`;
+    drawLines();
+    $('#le-rate').addEventListener('change', (e) => { ed.rate = +e.target.value; if (isMine()) audio.playbackRate = ed.rate; });
+    $('#le-lag').addEventListener('change', (e) => { ed.lag = +e.target.value; try { localStorage.setItem('hako.lyrLag', ed.lag); } catch {} });
+    $$('[data-le-shift]').forEach((b) => b.addEventListener('click', () => {
+      const d = +b.dataset.leShift;
+      ed.lines.forEach((l) => { if (l.t != null) l.t = Math.max(0, +(l.t + d).toFixed(2)); });
+      markDirty(); drawLines();
+    }));
+    $('#le-clear').addEventListener('click', () => {
+      if (!confirm('すべての行の時間を消しますか？')) return;
+      ed.lines.forEach((l) => (l.t = null)); ed.cur = 0; ed.sel = -1; markDirty(); drawLines();
+    });
+    $('#le-pp').addEventListener('click', play);
+    $('#le-back3').addEventListener('click', () => seekTo(pos() - 3));
+    $('#le-fwd3').addEventListener('click', () => seekTo(pos() + 3));
+    $('#le-tap').addEventListener('click', tap);
+    $('#le-undo').addEventListener('click', undo);
+    $('#le-minus').addEventListener('click', () => nudge(-0.1));
+    $('#le-plus').addEventListener('click', () => nudge(0.1));
+    $('#le-lines').addEventListener('click', (e) => {
+      const tb = e.target.closest('[data-le-t]');
+      if (tb) { const l = ed.lines[+tb.dataset.leT]; if (l.t != null) seekTo(l.t - 1); return; }
+      const row = e.target.closest('[data-le-i]');
+      if (row) { ed.cur = ed.sel = +row.dataset.leI; drawLines(); }
+    });
+  }
+
+  function drawLines() {
+    const box = $('#le-lines');
+    if (!box) return;
+    box.innerHTML = ed.lines.map((l, i) => {
+      const bad = l.t != null && ed.lines.slice(0, i).some((p) => p.t != null && p.t > l.t);
+      return `<div class="le-row${i === ed.cur ? ' next' : ''}${i === ed.sel ? ' sel' : ''}${bad ? ' bad' : ''}" data-le-i="${i}">
+        <button class="le-t${l.t == null ? ' none' : ''}" data-le-t="${i}">${l.t == null ? '--:--.--' : lrcStamp(l.t).slice(1, -1)}</button>
+        <span class="le-txt">${esc(l.text)}</span></div>`;
+    }).join('') + `<div class="le-row end${ed.cur >= ed.lines.length ? ' next' : ''}"><span class="le-txt dim small">（最後まで付け終わりました）</span></div>`;
+    const n = box.querySelector('.le-row.next');
+    if (n) {
+      const r = n.getBoundingClientRect();
+      if (r.top < 120 || r.bottom > innerHeight - 220) window.scrollBy({ top: r.top - innerHeight * 0.35, behavior: 'smooth' });
+    }
+  }
+
+  function tap() {
+    if (ed.cur >= ed.lines.length) return toast('最後の行まで付け終わっています');
+    if (!isMine() || audio.paused) return toast('先に曲を再生してください');
+    ed.lines[ed.cur].t = Math.max(0, +(pos() - ed.lag * ed.rate).toFixed(2));
+    ed.sel = ed.cur;
+    ed.cur++;
+    markDirty(); drawLines();
+  }
+  function undo() {
+    if (ed.cur <= 0) return;
+    ed.cur--;
+    const was = ed.lines[ed.cur].t;
+    ed.lines[ed.cur].t = null;
+    ed.sel = -1;
+    markDirty(); drawLines();
+    const prevT = ed.cur > 0 ? ed.lines[ed.cur - 1].t : null;
+    seekTo((prevT ?? was ?? pos()) - 1);
+  }
+  function nudge(d) {
+    const i = ed.sel >= 0 ? ed.sel : ed.cur - 1;
+    const l = ed.lines[i];
+    if (!l || l.t == null) return toast('時間を調整する行を選んでください');
+    l.t = Math.max(0, +(l.t + d).toFixed(2));
+    ed.sel = i;
+    markDirty(); drawLines();
+    seekTo(l.t - 1);
+  }
+
+  function setMode(mode) {
+    if (ed.mode === 'text') takeText();
+    ed.mode = mode;
+    $$('[data-le-mode]').forEach((b) => b.classList.toggle('on', b.dataset.leMode === mode));
+    if (mode === 'text') renderText(); else renderSync();
+  }
+  $$('[data-le-mode]').forEach((b) => b.addEventListener('click', () => setMode(b.dataset.leMode)));
+  setMode(ed.lines.length ? 'sync' : 'text');
+
+  function currentLrc() {
+    if (ed.mode === 'text') takeText();
+    return linesToLrc(ed.lines, t);
+  }
+
+  $('#le-dl').addEventListener('click', () => {
+    const text = currentLrc();
+    if (!text.trim()) return toast('歌詞がありません', true);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob(['﻿' + text + '\n'], { type: 'text/plain' }));
+    a.download = (t.title || 'lyrics').replace(/[\\/:*?"<>|]/g, '_') + '.lrc';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  });
+  if ($('#le-save')) $('#le-save').addEventListener('click', async () => {
+    const text = currentLrc();
+    if (!text.trim()) return toast('歌詞がありません', true);
+    const untimed = ed.lines.filter((l) => l.t == null).length;
+    if (untimed && untimed < ed.lines.length && !confirm(`時間が付いていない行が ${untimed} 行あります。その行は保存されません。保存しますか？`)) return;
+    try {
+      await api(`/tracks/${t.id}/lyrics`, { method: 'PUT', body: { text } });
+      state.lyricsCache.delete(t.id);
+      ed.dirty = false;
+      toast('歌詞を保存しました');
+      if ($('#lyr')) loadLyrics();
+    } catch (e) { toast(e.message, true); }
+  });
+  if ($('#le-del')) $('#le-del').addEventListener('click', async () => {
+    if (!confirm('Hako で作成したこの曲の歌詞を削除しますか？（.lrc ファイルや埋め込み歌詞は消えません）')) return;
+    try {
+      await api(`/tracks/${t.id}/lyrics`, { method: 'PUT', body: { text: '' } });
+      state.lyricsCache.delete(t.id);
+      ed.dirty = false;
+      toast('削除しました');
+      go(`#/lyrics/${t.id}`);
+    } catch (e) { toast(e.message, true); }
+  });
+
+  // live display: position, play state, the line being sung
+  const iv = setInterval(() => {
+    const tm = $('#le-time');
+    if (!tm) return;
+    tm.textContent = fmtTime(pos());
+    const pp = $('#le-pp');
+    const playing = isMine() && !audio.paused;
+    if (pp && pp.dataset.p !== String(playing)) { pp.dataset.p = playing; pp.innerHTML = playing ? I.pause : I.play; }
+    const p = pos();
+    let k = -1;
+    ed.lines.forEach((l, i) => { if (l.t != null && l.t <= p + 0.05) k = i; });
+    $$('.le-row.sing').forEach((r) => r.classList.remove('sing'));
+    if (playing && k >= 0) { const r = $(`.le-row[data-le-i="${k}"]`); if (r) r.classList.add('sing'); }
+  }, 100);
+
+  keyHook = (e) => {
+    if (ed.mode !== 'sync' || e.target.closest('input, textarea, select')) return false;
+    if (e.code === 'Space' || e.key === 'Enter') { e.preventDefault(); tap(); return true; }
+    if (e.key === 'Backspace') { e.preventDefault(); undo(); return true; }
+    if (e.key === 'ArrowLeft') { e.preventDefault(); seekTo(pos() - 3); return true; }
+    if (e.key === 'ArrowRight') { e.preventDefault(); seekTo(pos() + 3); return true; }
+    if (e.key === 'p' || e.key === 'k') { play(); return true; }
+    return false;
+  };
+  const warn = (e) => { if (ed.dirty) { e.preventDefault(); e.returnValue = ''; } };
+  window.addEventListener('beforeunload', warn);
+  routeCleanup = () => {
+    clearInterval(iv);
+    keyHook = null;
+    window.removeEventListener('beforeunload', warn);
+    if (isMine()) audio.playbackRate = 1;
+    if (ed.dirty) toast('保存していない変更は破棄されました');
+  };
+}
+
+/* ============================================================
    Router & views
    ============================================================ */
 
@@ -985,6 +1283,7 @@ const routes = [
   [/^#\/playlists$/, viewPlaylists, { tab: 'playlists' }],
   [/^#\/playlist\/(\d+)$/, viewPlaylist, { tab: 'playlists' }],
   [/^#\/settings$/, viewSettings, { tab: 'settings' }],
+  [/^#\/lyrics\/(\d+)$/, viewLyricsEdit, { tab: 'songs' }],
 ];
 
 let routeCleanup = null;
@@ -1811,11 +2110,13 @@ document.addEventListener('click', (e) => {
 });
 
 $('#sheet').addEventListener('click', (e) => {
+  if (e.target.closest('[data-lyr-edit]')) { const t = cur(); if (t) popLayer(`#/lyrics/${t.id}`); return; }
   const p = e.target.closest('#lyr p[data-li]');
   if (p && lyr && lyr.synced) { seek(lyr.lines[+p.dataset.li].t); lyrUserScroll = 0; }
 });
 
 document.addEventListener('keydown', (e) => {
+  if (keyHook && keyHook(e)) return;
   if (e.target.closest('input, textarea, select')) return;
   if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
   else if (e.key === 'ArrowRight' && e.shiftKey) next();
